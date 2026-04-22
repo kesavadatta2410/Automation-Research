@@ -1,0 +1,102 @@
+version: "3.9"
+
+services:
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: autoresearch_api
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - sqlite_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/autoresearch.db
+      - OLLAMA_BASE_URL=http://ollama:11434
+    env_file:
+      - .env
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Streamlit Frontend ───────────────────────────────────────────────────────
+  ui:
+    build: .
+    container_name: autoresearch_ui
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+    environment:
+      - API_BASE_URL=http://api:8000
+    env_file:
+      - .env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Scheduler ────────────────────────────────────────────────────────────────
+  scheduler:
+    build: .
+    container_name: autoresearch_scheduler
+    command: python services/scheduler.py
+    volumes:
+      - .:/app
+      - sqlite_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/autoresearch.db
+    env_file:
+      - .env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Ollama (Local LLM) ───────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: autoresearch_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    # Uncomment for GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── n8n Automation ───────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: autoresearch_n8n
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=autoresearch2024
+      - WEBHOOK_URL=http://localhost:5678
+      - API_BASE_URL=http://api:8000
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:
+  ollama_data:
+  n8n_data:
