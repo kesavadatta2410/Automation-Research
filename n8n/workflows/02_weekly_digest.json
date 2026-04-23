@@ -1,0 +1,130 @@
+{
+  "name": "02 — Weekly Research Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 9 * * 1" }]
+        }
+      },
+      "id": "ar-node-02-trigger",
+      "name": "Schedule: Monday 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8000/api/n8n/summary-stats",
+        "options": {}
+      },
+      "id": "ar-node-02-stats",
+      "name": "GET Summary Stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8000/api/insights/trends",
+        "options": {}
+      },
+      "id": "ar-node-02-trends",
+      "name": "GET Trends",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 400]
+    },
+    {
+      "parameters": {
+        "mode": "multiplex"
+      },
+      "id": "ar-node-02-merge",
+      "name": "Merge Stats + Trends",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge stats and trends into weekly digest HTML\nconst all = $input.all();\nconst stats  = all[0]?.json || {};\nconst trends = all[1]?.json || {};\n\nconst date = new Date().toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' });\nconst topKws = (trends.top_keywords || []).slice(0, 8).map(k => `<span style=\"background:rgba(108,99,255,.15);color:#6C63FF;padding:4px 12px;border-radius:20px;font-size:13px;margin:3px;display:inline-block;\">${k}</span>`).join('');\nconst narrative = trends.trend_narrative || '';\n\nconst html = `<html><body style=\"background:#f5f7ff;font-family:sans-serif;padding:32px;\">\n<div style=\"max-width:700px;margin:auto;\">\n\n<div style=\"background:linear-gradient(135deg,#6C63FF,#4a42cc);color:white;padding:32px;border-radius:16px;margin-bottom:24px;\">\n  <h1 style=\"margin:0;\">🔬 AutoResearch AI</h1>\n  <h2 style=\"margin:8px 0 0;opacity:.9;\">Weekly Research Digest</h2>\n  <p style=\"opacity:.7;margin:8px 0 0;\">${date}</p>\n</div>\n\n<div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px;\">\n  <div style=\"background:white;border-radius:12px;padding:20px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06);\">\n    <div style=\"font-size:2rem;font-weight:700;color:#6C63FF;\">${stats.total_papers || 0}</div>\n    <div style=\"color:#888;font-size:13px;\">Total Papers</div>\n  </div>\n  <div style=\"background:white;border-radius:12px;padding:20px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06);\">\n    <div style=\"font-size:2rem;font-weight:700;color:#6C63FF;\">${stats.topics || 0}</div>\n    <div style=\"color:#888;font-size:13px;\">Research Topics</div>\n  </div>\n  <div style=\"background:white;border-radius:12px;padding:20px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06);\">\n    <div style=\"font-size:2rem;font-weight:700;color:#6C63FF;\">${stats.opportunities || 0}</div>\n    <div style=\"color:#888;font-size:13px;\">Opportunities</div>\n  </div>\n</div>\n\n<div style=\"background:white;border-radius:12px;padding:24px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.06);\">\n  <h3 style=\"color:#6C63FF;margin-top:0;\">🔑 Trending Keywords This Week</h3>\n  <div style=\"padding:8px 0;\">${topKws || '<em>No keyword data yet</em>'}</div>\n</div>\n\n${narrative ? `<div style=\"background:white;border-radius:12px;padding:24px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.06);\"><h3 style=\"color:#6C63FF;margin-top:0;\">🔭 AI Trend Analysis</h3><p style=\"color:#444;line-height:1.7;\">${narrative}</p></div>` : ''}\n\n<div style=\"background:white;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.06);\">\n  <h3 style=\"color:#6C63FF;margin-top:0;\">📊 Outreach Status</h3>\n  <p>Un-contacted opportunities: <strong>${stats.un_contacted || 0}</strong></p>\n  <a href=\"http://localhost:8501\" style=\"background:#6C63FF;color:white;padding:10px 20px;border-radius:8px;text-decoration:none;\">Open Dashboard →</a>\n</div>\n\n<p style=\"color:#aaa;font-size:12px;text-align:center;\">AutoResearch AI Weekly Digest · Powered by HuggingFace AI</p>\n</div></body></html>`;\n\nconst telegram = `📊 *AutoResearch AI — Weekly Digest*\\n\\n📄 Papers: *${stats.total_papers || 0}*\\n🏷️ Topics: *${stats.topics || 0}*\\n🎯 Opportunities: *${stats.opportunities || 0}*\\n\\n🔑 Top keywords: ${(trends.top_keywords || []).slice(0,5).join(', ')}\\n\\n[Open Dashboard](http://localhost:8501)`;\n\nreturn [{ json: { html, telegram, date } }];"
+      },
+      "id": "ar-node-02-format",
+      "name": "Format Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "AutoResearch AI <noreply@autoresearch.ai>",
+        "toEmail": "={{ $env.SMTP_USER }}",
+        "subject": "=📊 AutoResearch Weekly Digest — {{ $json.date }}",
+        "emailType": "html",
+        "html": "={{ $json.html }}"
+      },
+      "id": "ar-node-02-email",
+      "name": "Send Digest Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [960, 200],
+      "credentials": { "smtp": { "id": "smtp-cred", "name": "AutoResearch SMTP" } }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.telegram }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "ar-node-02-telegram",
+      "name": "Telegram Digest Summary",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [960, 420],
+      "credentials": { "telegramApi": { "id": "tg-cred", "name": "AutoResearch Telegram" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/webhook/n8n-event",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"workflow\": \"02_weekly_digest\", \"event\": \"execution_finished\", \"status\": \"success\", \"message\": \"Weekly digest sent successfully\"}",
+        "options": {}
+      },
+      "id": "ar-node-02-log",
+      "name": "Log Execution",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 300]
+    }
+  ],
+  "connections": {
+    "Schedule: Monday 09:00": {
+      "main": [
+        [{ "node": "GET Summary Stats", "type": "main", "index": 0 },
+         { "node": "GET Trends",        "type": "main", "index": 0 }]
+      ]
+    },
+    "GET Summary Stats": { "main": [[{ "node": "Merge Stats + Trends", "type": "main", "index": 0 }]] },
+    "GET Trends":        { "main": [[{ "node": "Merge Stats + Trends", "type": "main", "index": 1 }]] },
+    "Merge Stats + Trends": { "main": [[{ "node": "Format Digest", "type": "main", "index": 0 }]] },
+    "Format Digest": {
+      "main": [
+        [{ "node": "Send Digest Email",      "type": "main", "index": 0 },
+         { "node": "Telegram Digest Summary","type": "main", "index": 0 }]
+      ]
+    },
+    "Send Digest Email":       { "main": [[{ "node": "Log Execution", "type": "main", "index": 0 }]] },
+    "Telegram Digest Summary": { "main": [[{ "node": "Log Execution", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "instanceId": "autoresearch-ai" },
+  "id": "ar-wf-002",
+  "tags": [{ "name": "AutoResearch" }]
+}

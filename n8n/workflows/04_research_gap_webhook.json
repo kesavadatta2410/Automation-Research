@@ -1,0 +1,113 @@
+{
+  "name": "04 — Research Gap Analysis Webhook",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gap-analysis",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ar-node-04-webhook",
+      "name": "Webhook: POST /gap-analysis",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [80, 300],
+      "webhookId": "ar-gap-analysis-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract and validate topic from webhook body\nconst body = $input.first().json.body || $input.first().json;\nconst topic = body.topic || '';\nif (!topic) throw new Error('Missing required field: topic');\nreturn [{ json: { topic: topic.trim(), max_papers: body.max_papers || 15 } }];"
+      },
+      "id": "ar-node-04-validate",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/api/papers/search",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.topic, max_results: $json.max_papers, auto_summarize: false }) }}",
+        "options": {}
+      },
+      "id": "ar-node-04-fetch",
+      "name": "Fetch Papers for Topic",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/webhook/gap-analysis",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ topic: $('Validate Input').first().json.topic, max_papers: $('Validate Input').first().json.max_papers }) }}",
+        "options": {}
+      },
+      "id": "ar-node-04-gaps",
+      "name": "Get Research Gaps (AI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const gapData = $input.first().json;\nconst topic = gapData.topic || 'Unknown';\nconst gaps = gapData.gaps || [];\nconst paperCount = gapData.paper_count || 0;\n\n// Build Telegram message\nlet tgLines = [`🔭 *Research Gaps — ${topic}*`, `📄 Analysed ${paperCount} papers\\n`];\nfor (const [i, g] of gaps.entries()) {\n  const conf = Math.round((g.confidence || 0.5) * 100);\n  tgLines.push(`${i+1}. *${g.gap}* [${conf}%]`);\n  if (g.explanation) tgLines.push(`   _${g.explanation.substring(0,120)}..._`);\n}\nconst telegramMsg = tgLines.join('\\n');\n\n// Build JSON response\nconst response = {\n  status: 'success',\n  topic,\n  paper_count: paperCount,\n  gap_count: gaps.length,\n  gaps,\n  timestamp: new Date().toISOString()\n};\n\nreturn [{ json: { response, telegramMsg } }];"
+      },
+      "id": "ar-node-04-format",
+      "name": "Format Gap Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "ar-node-04-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1180, 200]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.telegramMsg }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "ar-node-04-telegram",
+      "name": "Telegram Gap Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1180, 420],
+      "credentials": { "telegramApi": { "id": "tg-cred", "name": "AutoResearch Telegram" } }
+    }
+  ],
+  "connections": {
+    "Webhook: POST /gap-analysis": { "main": [[{ "node": "Validate Input",        "type": "main", "index": 0 }]] },
+    "Validate Input":              { "main": [[{ "node": "Fetch Papers for Topic", "type": "main", "index": 0 }]] },
+    "Fetch Papers for Topic":      { "main": [[{ "node": "Get Research Gaps (AI)", "type": "main", "index": 0 }]] },
+    "Get Research Gaps (AI)":      { "main": [[{ "node": "Format Gap Report",      "type": "main", "index": 0 }]] },
+    "Format Gap Report": {
+      "main": [
+        [{ "node": "Respond to Webhook", "type": "main", "index": 0 },
+         { "node": "Telegram Gap Report","type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "instanceId": "autoresearch-ai" },
+  "id": "ar-wf-004",
+  "tags": [{ "name": "AutoResearch" }]
+}

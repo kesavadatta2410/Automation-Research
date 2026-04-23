@@ -13,6 +13,8 @@ build/
 
 # Virtual Environments
 auto/
+venv/
+.venv/
 
 
 # =========================
@@ -55,16 +57,15 @@ Thumbs.db
 .streamlit/secrets.toml
 
 # =========================
-# Node / n8n (if used locally)
+# Node / npm
 # =========================
 node_modules/
 npm-debug.log*
-.n8n/
 
 # =========================
-# Docker
+# Startup process files
 # =========================
-docker-compose.override.yml
+scheduler.log
 
 # =========================
 # Misc

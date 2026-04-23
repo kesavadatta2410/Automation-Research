@@ -1,0 +1,152 @@
+{
+  "name": "05 — Outreach Email Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 10 * * 2" }]
+        }
+      },
+      "id": "ar-node-05-trigger",
+      "name": "Schedule: Tuesday 10:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8000/api/opportunities?contacted=false",
+        "options": {}
+      },
+      "id": "ar-node-05-opps",
+      "name": "GET Un-contacted Opportunities",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter only opportunities that have an email address\nconst items = $input.all();\nconst opps = items.map(i => i.json).filter(o => o.email && o.email.includes('@'));\nif (opps.length === 0) return [{ json: { skip: true, message: 'No un-contacted opportunities with email found.' } }];\nreturn opps.map(o => ({ json: o }));"
+      },
+      "id": "ar-node-05-filter",
+      "name": "Filter: Has Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [{ "leftValue": "={{ $json.skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notEquals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "ar-node-05-if",
+      "name": "Any Opportunities?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [740, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "ar-node-05-split",
+      "name": "Process One at a Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [960, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://localhost:8000/api/opportunities/{{ $json.id }}/generate-email",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ professor_name: $json.name, institution: $json.institution, research_area: $json.research_area || 'Research', your_background: 'I am a researcher interested in your work', your_name: 'AutoResearch User' }) }}",
+        "options": {}
+      },
+      "id": "ar-node-05-genemail",
+      "name": "Generate Outreach Email (AI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 200]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_USER }}",
+        "toEmail": "={{ $('Process One at a Time').item.json.email }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "html": "=<html><body style=\"font-family:sans-serif;line-height:1.6;padding:20px;max-width:600px;\">\n{{ $json.body.replace(/\\n/g, '<br>') }}\n<hr style=\"margin-top:30px;border-color:#eee;\">\n<small style=\"color:#888;\">Sent via AutoResearch AI · <a href=\"http://localhost:8501\">Dashboard</a></small>\n</body></html>"
+      },
+      "id": "ar-node-05-email",
+      "name": "Send Outreach Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1400, 200],
+      "credentials": { "smtp": { "id": "smtp-cred", "name": "AutoResearch SMTP" } }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=http://localhost:8000/api/opportunities/{{ $('Process One at a Time').item.json.id }}/contacted",
+        "options": {}
+      },
+      "id": "ar-node-05-mark",
+      "name": "Mark as Contacted",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 200]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "seconds"
+      },
+      "id": "ar-node-05-wait",
+      "name": "Wait 2s (Rate Limit)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1840, 200]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "=✅ *AutoResearch Outreach Pipeline Complete*\n\nEmails sent to all un-contacted opportunities.\n\n[View Pipeline](http://localhost:8501)",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "ar-node-05-telegram",
+      "name": "Telegram Completion",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [960, 420],
+      "credentials": { "telegramApi": { "id": "tg-cred", "name": "AutoResearch Telegram" } }
+    }
+  ],
+  "connections": {
+    "Schedule: Tuesday 10:00":          { "main": [[{ "node": "GET Un-contacted Opportunities", "type": "main", "index": 0 }]] },
+    "GET Un-contacted Opportunities":   { "main": [[{ "node": "Filter: Has Email",              "type": "main", "index": 0 }]] },
+    "Filter: Has Email":                { "main": [[{ "node": "Any Opportunities?",             "type": "main", "index": 0 }]] },
+    "Any Opportunities?": {
+      "main": [
+        [{ "node": "Process One at a Time",  "type": "main", "index": 0 }],
+        [{ "node": "Telegram Completion",    "type": "main", "index": 0 }]
+      ]
+    },
+    "Process One at a Time":      { "main": [[{ "node": "Generate Outreach Email (AI)", "type": "main", "index": 0 }]] },
+    "Generate Outreach Email (AI)":{ "main": [[{ "node": "Send Outreach Email",         "type": "main", "index": 0 }]] },
+    "Send Outreach Email":         { "main": [[{ "node": "Mark as Contacted",           "type": "main", "index": 0 }]] },
+    "Mark as Contacted":           { "main": [[{ "node": "Wait 2s (Rate Limit)",        "type": "main", "index": 0 }]] },
+    "Wait 2s (Rate Limit)":        { "main": [[{ "node": "Process One at a Time",       "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "instanceId": "autoresearch-ai" },
+  "id": "ar-wf-005",
+  "tags": [{ "name": "AutoResearch" }]
+}

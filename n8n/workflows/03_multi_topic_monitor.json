@@ -1,0 +1,110 @@
+{
+  "name": "03 — Multi-Topic Hourly Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 1 }]
+        }
+      },
+      "id": "ar-node-03-trigger",
+      "name": "Schedule: Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8000/api/n8n/topics",
+        "options": {}
+      },
+      "id": "ar-node-03-topics",
+      "name": "GET Topics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst topics = items.map(i => i.json.topic).filter(Boolean);\nif (topics.length === 0) return [{ json: { topics: [], skip: true } }];\nreturn [{ json: { topics, skip: false } }];"
+      },
+      "id": "ar-node-03-extract",
+      "name": "Extract Topics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/api/n8n/bulk-fetch",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ topics: $json.topics, max_results: 5, date_filter_days: 1, auto_summarize: false }) }}",
+        "options": {}
+      },
+      "id": "ar-node-03-bulk",
+      "name": "Bulk Fetch Last 24h",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only alert if any topic has >= 3 new papers (smart threshold)\nconst results = $input.all().map(i => i.json);\nconst hot = results.filter(r => r.count >= 3);\nif (hot.length === 0) return [{ json: { skip: true } }];\n\nconst lines = hot.map(r => `• *${r.topic}*: ${r.count} new papers`);\nconst msg = `🚨 *AutoResearch AI — Hourly Alert*\\n\\n${lines.join('\\n')}\\n\\n_[View Dashboard](http://localhost:8501)_`;\nreturn [{ json: { message: msg, hot_count: hot.length, skip: false } }];"
+      },
+      "id": "ar-node-03-filter",
+      "name": "Filter Hot Topics (≥3)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [{ "leftValue": "={{ $json.skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notEquals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "ar-node-03-if",
+      "name": "Any Hot Topics?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1180, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "ar-node-03-telegram",
+      "name": "Telegram Hot Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1400, 200],
+      "credentials": { "telegramApi": { "id": "tg-cred", "name": "AutoResearch Telegram" } }
+    }
+  ],
+  "connections": {
+    "Schedule: Every Hour":   { "main": [[{ "node": "GET Topics",           "type": "main", "index": 0 }]] },
+    "GET Topics":             { "main": [[{ "node": "Extract Topics",        "type": "main", "index": 0 }]] },
+    "Extract Topics":         { "main": [[{ "node": "Bulk Fetch Last 24h",   "type": "main", "index": 0 }]] },
+    "Bulk Fetch Last 24h":    { "main": [[{ "node": "Filter Hot Topics (≥3)","type": "main", "index": 0 }]] },
+    "Filter Hot Topics (≥3)": { "main": [[{ "node": "Any Hot Topics?",       "type": "main", "index": 0 }]] },
+    "Any Hot Topics?": {
+      "main": [
+        [{ "node": "Telegram Hot Alert", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": false },
+  "meta": { "instanceId": "autoresearch-ai" },
+  "id": "ar-wf-003",
+  "tags": [{ "name": "AutoResearch" }]
+}

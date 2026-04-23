@@ -1,204 +1,365 @@
 """
-services/ai_service.py — AI summarization, keywords, trends, research gap detection
-Uses Ollama (local LLM) with HuggingFace fallback.
+services/ai_service.py — AI summarization, keyword extraction, trend analysis,
+research gap detection, and outreach email generation.
+
+Primary engine: HuggingFace Inference API (cloud, free-tier compatible)
+  - Summarization : facebook/bart-large-cnn
+  - Chat / reasoning: mistralai/Mistral-7B-Instruct-v0.3
+
+All functions include robust extractive/template fallbacks so the platform
+remains fully functional even when the HF API is rate-limited or unavailable.
 """
-import os
+from __future__ import annotations
+
 import json
+import os
 import re
-from typing import List, Optional
-from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
+import time
+from typing import Any, Dict, List, Optional
+
+import requests
 from dotenv import load_dotenv
+from loguru import logger
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 load_dotenv()
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3")
-HF_TOKEN        = os.getenv("HUGGINGFACE_API_TOKEN", "")
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+HF_TOKEN: str = os.getenv("HUGGINGFACE_API_TOKEN", "")
+HF_MODEL_SUMMARIZE: str = os.getenv(
+    "HF_MODEL_SUMMARIZE", "facebook/bart-large-cnn"
+)
+HF_MODEL_CHAT: str = os.getenv(
+    "HF_MODEL_CHAT", "mistralai/Mistral-7B-Instruct-v0.3"
+)
+HF_API_BASE = "https://api-inference.huggingface.co/models"
+
+_HEADERS: Dict[str, str] = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+# Common English stopwords for extractive fallbacks
+_STOPWORDS = {
+    "the", "a", "an", "of", "in", "and", "or", "to", "for", "is", "are",
+    "was", "were", "with", "this", "that", "these", "those", "we", "our",
+    "their", "its", "be", "by", "on", "at", "from", "as", "it", "has",
+    "have", "had", "not", "but", "can", "will", "would", "which", "than",
+    "into", "also", "more", "use", "used", "using", "show", "shows",
+    "based", "both", "each", "such", "when", "than", "about",
+}
 
 
-# ── Ollama helpers ────────────────────────────────────────────────────────────
+# ── Low-level HuggingFace helpers ─────────────────────────────────────────────
 
-def _ollama_available() -> bool:
+class HFRateLimitError(Exception):
+    """Raised when the HuggingFace API returns 429 or 503."""
+
+
+@retry(
+    retry=retry_if_exception_type(HFRateLimitError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=3, max=20),
+)
+def _hf_post(model: str, payload: dict, timeout: int = 45) -> Any:
+    """
+    POST to HuggingFace Inference API with retry on rate-limit.
+    Returns parsed JSON response.
+    """
+    if not HF_TOKEN:
+        raise ValueError("HUGGINGFACE_API_TOKEN is not set in environment.")
+
+    url = f"{HF_API_BASE}/{model}"
+    resp = requests.post(url, headers=_HEADERS, json=payload, timeout=timeout)
+
+    if resp.status_code in (429, 503):
+        retry_after = int(resp.headers.get("Retry-After", 5))
+        logger.warning(
+            f"HF API rate-limited on {model}. Retrying in {retry_after}s."
+        )
+        time.sleep(retry_after)
+        raise HFRateLimitError(f"Rate limit: {resp.status_code}")
+
+    if resp.status_code == 503:
+        # Model loading — wait and retry
+        est = resp.json().get("estimated_time", 10)
+        logger.info(f"Model {model} loading, waiting {est:.0f}s.")
+        time.sleep(min(float(est), 20))
+        raise HFRateLimitError("Model loading")
+
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ── Summarization ─────────────────────────────────────────────────────────────
+
+def _hf_summarize(text: str, max_length: int = 220, min_length: int = 60) -> str:
+    """
+    Abstractive summarization via BART-large-CNN.
+    Falls back to extractive if API fails.
+    """
     try:
-        import requests
-        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=4))
-def _ollama_generate(prompt: str, system: str = "") -> str:
-    import requests
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-    }
-    if system:
-        payload["system"] = system
-    r = requests.post(
-        f"{OLLAMA_BASE_URL}/api/generate",
-        json=payload,
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json().get("response", "").strip()
-
-
-# ── HuggingFace fallback ──────────────────────────────────────────────────────
-
-def _hf_summarize(text: str, max_length: int = 200) -> str:
-    """BART summarizer via HF Inference API."""
-    import requests
-    api_url = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": text[:1024],
-        "parameters": {"max_length": max_length, "min_length": 60},
-    }
-    try:
-        r = requests.post(api_url, headers=headers, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+        data = _hf_post(
+            HF_MODEL_SUMMARIZE,
+            {
+                "inputs": text[:1024],
+                "parameters": {
+                    "max_length": max_length,
+                    "min_length": min_length,
+                    "do_sample": False,
+                },
+            },
+        )
         if isinstance(data, list) and data:
-            return data[0].get("summary_text", "")
-    except Exception as e:
-        logger.warning(f"HF summarize fallback failed: {e}")
-    # Simple extractive fallback
-    sentences = text.split(". ")
-    return ". ".join(sentences[:3]) + "."
+            return data[0].get("summary_text", "").strip()
+    except Exception as exc:
+        logger.warning(f"HF summarize failed, using extractive fallback: {exc}")
+
+    # Extractive fallback: first 3 sentences
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    return " ".join(sentences[:3]).strip()
+
+
+# ── Chat / Instruction following ──────────────────────────────────────────────
+
+def _hf_chat(prompt: str, system: str = "", max_tokens: int = 512) -> str:
+    """
+    Instruction-following generation via Mistral-7B-Instruct.
+    Formats prompt using the [INST] template expected by Mistral.
+    Falls back to empty string on failure (callers handle gracefully).
+    """
+    if system:
+        full_prompt = f"<s>[INST] {system}\n\n{prompt} [/INST]"
+    else:
+        full_prompt = f"<s>[INST] {prompt} [/INST]"
+
+    try:
+        data = _hf_post(
+            HF_MODEL_CHAT,
+            {
+                "inputs": full_prompt,
+                "parameters": {
+                    "max_new_tokens": max_tokens,
+                    "temperature": 0.3,
+                    "do_sample": True,
+                    "return_full_text": False,
+                },
+            },
+        )
+        if isinstance(data, list) and data:
+            return data[0].get("generated_text", "").strip()
+    except Exception as exc:
+        logger.warning(f"HF chat failed: {exc}")
+
+    return ""
+
+
+def _extract_json_array(text: str) -> Optional[list]:
+    """Extract the first JSON array found in an LLM response."""
+    match = re.search(r"\[.*?\]", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Extract the first JSON object found in an LLM response."""
+    match = re.search(r"\{.*?\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+# ── Extractive keyword helper ─────────────────────────────────────────────────
+
+def _extractive_keywords(text: str, top_n: int = 8) -> List[str]:
+    """Simple TF-IDF-style frequency-based keyword extractor."""
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
+    freq: Dict[str, int] = {}
+    for w in words:
+        if w not in _STOPWORDS:
+            freq[w] = freq.get(w, 0) + 1
+    return [w for w, _ in sorted(freq.items(), key=lambda x: -x[1])[:top_n]]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def summarize_paper(title: str, abstract: str) -> str:
-    """Generate 3-5 sentence summary of a paper."""
-    prompt = (
-        f"Title: {title}\n\nAbstract: {abstract}\n\n"
-        "Write a clear, concise 3-5 sentence summary of this research paper "
-        "for a graduate student audience. Focus on: problem, method, key findings, impact."
-    )
-    if _ollama_available():
-        try:
-            return _ollama_generate(
-                prompt,
-                system="You are an expert research summarizer. Be precise and informative."
-            )
-        except Exception as e:
-            logger.warning(f"Ollama failed, falling back to HF: {e}")
-    return _hf_summarize(f"{title}. {abstract}")
+    """
+    Generate a 3-5 sentence AI summary of a research paper.
+
+    Uses BART-large-CNN for abstractive summarization with automatic
+    extractive fallback.
+    """
+    combined = f"{title}. {abstract}"
+    logger.info(f"Summarizing: {title[:60]}...")
+    return _hf_summarize(combined, max_length=220, min_length=60)
 
 
 def extract_keywords(text: str, top_n: int = 8) -> List[str]:
-    """Extract top keywords/concepts from text."""
+    """
+    Extract the top N technical keywords/concepts from text.
+
+    Attempts LLM-based extraction first; falls back to TF-IDF.
+    """
     prompt = (
         f"Extract the {top_n} most important technical keywords and concepts "
-        f"from this text. Return ONLY a JSON array of strings, no explanation.\n\nText: {text[:800]}"
+        f"from the following research text. Return ONLY a JSON array of strings "
+        f"with no explanation.\n\nText:\n{text[:800]}"
     )
-    if _ollama_available():
-        try:
-            raw = _ollama_generate(prompt)
-            # Parse JSON array from response
-            match = re.search(r'\[.*?\]', raw, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-        except Exception as e:
-            logger.warning(f"Keyword extraction via Ollama failed: {e}")
+    raw = _hf_chat(prompt)
+    if raw:
+        parsed = _extract_json_array(raw)
+        if parsed and isinstance(parsed, list):
+            return [str(k) for k in parsed[:top_n]]
 
-    # Simple TF-IDF-style fallback
-    import re as _re
-    stopwords = {"the","a","an","of","in","and","or","to","for","is","are","was",
-                 "with","this","that","these","those","we","our","their","its"}
-    words = _re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
-    freq: dict = {}
-    for w in words:
-        if w not in stopwords:
-            freq[w] = freq.get(w, 0) + 1
-    return [w for w, _ in sorted(freq.items(), key=lambda x: -x[1])[:top_n]]
+    logger.info("Keyword extraction: using TF-IDF fallback.")
+    return _extractive_keywords(text, top_n=top_n)
 
 
 def analyze_trends(papers: List[dict]) -> dict:
     """
-    Analyze keyword/topic trends across a list of papers.
-    Returns {keyword: count} mapping and top emerging themes.
+    Analyze keyword/topic trends across a collection of papers.
+
+    Returns:
+        {
+            "keyword_frequency": {keyword: count, ...},
+            "top_keywords":      [str, ...],
+            "trend_narrative":   str,
+        }
     """
     all_text = " ".join(
-        f"{p.get('title','')} {p.get('abstract','')}" for p in papers
+        f"{p.get('title', '')} {p.get('abstract', '')}" for p in papers
     )
     keywords = extract_keywords(all_text, top_n=20)
 
-    # Count per paper
-    freq: dict = {}
+    # Count keyword occurrences per paper
+    freq: Dict[str, int] = {}
     for kw in keywords:
         freq[kw] = sum(
-            1 for p in papers
-            if kw.lower() in (p.get("title","") + p.get("abstract","")).lower()
+            1
+            for p in papers
+            if kw.lower() in (p.get("title", "") + p.get("abstract", "")).lower()
         )
 
-    # Ask LLM for trend narrative
+    # LLM trend narrative
     narrative = ""
-    if _ollama_available() and papers:
-        titles = "\n".join(f"- {p['title']}" for p in papers[:15])
-        try:
-            narrative = _ollama_generate(
-                f"Based on these research paper titles, describe 3 emerging trends in 2-3 sentences each:\n{titles}",
-                system="You are a research trend analyst. Be specific and insightful."
-            )
-        except Exception:
-            pass
+    if papers:
+        titles_block = "\n".join(f"- {p['title']}" for p in papers[:15])
+        prompt = (
+            f"Based on the following research paper titles, describe 3 emerging "
+            f"research trends in 2-3 sentences each. Be specific and cite patterns "
+            f"you observe across titles.\n\nTitles:\n{titles_block}"
+        )
+        narrative = _hf_chat(
+            prompt,
+            system="You are a senior research analyst identifying emerging scientific trends.",
+            max_tokens=400,
+        )
 
     return {
-        "keyword_frequency": dict(sorted(freq.items(), key=lambda x: -x[1])),
-        "top_keywords":      keywords[:10],
-        "trend_narrative":   narrative,
+        "keyword_frequency": dict(
+            sorted(freq.items(), key=lambda x: -x[1])
+        ),
+        "top_keywords": keywords[:10],
+        "trend_narrative": narrative,
     }
 
 
 def detect_research_gaps(papers: List[dict], topic: str) -> List[dict]:
     """
     Identify research gaps from a collection of papers.
-    Returns list of {gap, confidence, explanation}.
+
+    Returns list of:
+        {"gap": str, "explanation": str, "confidence": float}
     """
     if not papers:
-        return []
+        return _default_gaps(topic)
 
-    abstracts = "\n\n".join(
-        f"Paper {i+1}: {p.get('title','')}\n{p.get('abstract','')[:300]}"
+    abstracts_block = "\n\n".join(
+        f"Paper {i + 1}: {p.get('title', '')}\n"
+        f"{p.get('abstract', '')[:300]}"
         for i, p in enumerate(papers[:10])
     )
 
     prompt = (
-        f"Topic: {topic}\n\nRecent Papers:\n{abstracts}\n\n"
-        "Identify 3-5 significant research gaps or open problems NOT addressed by these papers. "
-        "Return a JSON array where each item has: "
-        '{"gap": "...", "explanation": "...", "confidence": 0.0-1.0}'
+        f"Topic: {topic}\n\n"
+        f"Recent papers:\n{abstracts_block}\n\n"
+        f"Identify 3-5 significant research gaps or open problems NOT addressed "
+        f"by these papers. Return a JSON array where each element has exactly "
+        f'these keys: "gap" (string), "explanation" (string), "confidence" '
+        f"(float 0.0-1.0)."
     )
 
-    if _ollama_available():
-        try:
-            raw = _ollama_generate(
-                prompt,
-                system="You are a senior researcher identifying novel research directions."
-            )
-            match = re.search(r'\[.*?\]', raw, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-        except Exception as e:
-            logger.warning(f"Gap detection failed: {e}")
+    raw = _hf_chat(
+        prompt,
+        system=(
+            "You are a senior researcher identifying novel directions for future work. "
+            "Respond ONLY with a valid JSON array."
+        ),
+        max_tokens=600,
+    )
 
-    # Fallback: static template gaps
+    if raw:
+        parsed = _extract_json_array(raw)
+        if parsed and isinstance(parsed, list) and len(parsed) > 0:
+            # Validate and clean each entry
+            cleaned = []
+            for item in parsed:
+                if isinstance(item, dict) and "gap" in item:
+                    cleaned.append(
+                        {
+                            "gap": str(item.get("gap", "")),
+                            "explanation": str(item.get("explanation", "")),
+                            "confidence": float(
+                                max(0.0, min(1.0, item.get("confidence", 0.6)))
+                            ),
+                        }
+                    )
+            if cleaned:
+                return cleaned
+
+    logger.info("Gap detection: using static template fallback.")
+    return _default_gaps(topic)
+
+
+def _default_gaps(topic: str) -> List[dict]:
+    """Static fallback research gaps when LLM is unavailable."""
     return [
         {
-            "gap": f"Real-world deployment challenges in {topic}",
-            "explanation": "Most papers focus on benchmark datasets; real-world robustness unexplored.",
-            "confidence": 0.65,
+            "gap": f"Real-world deployment and robustness in {topic}",
+            "explanation": (
+                "Most published work evaluates on benchmark datasets. "
+                "Performance under distribution shift and noisy real-world "
+                "conditions remains underexplored."
+            ),
+            "confidence": 0.68,
         },
         {
             "gap": f"Interpretability and explainability in {topic} models",
-            "explanation": "Black-box nature limits adoption in high-stakes domains.",
-            "confidence": 0.72,
+            "explanation": (
+                "Black-box nature of state-of-the-art models limits adoption "
+                "in safety-critical and regulated domains."
+            ),
+            "confidence": 0.74,
+        },
+        {
+            "gap": f"Computational efficiency and resource constraints in {topic}",
+            "explanation": (
+                "Current SOTA methods require large compute budgets. "
+                "Efficient, lightweight alternatives suitable for edge "
+                "deployment are scarce."
+            ),
+            "confidence": 0.61,
         },
     ]
 
@@ -210,40 +371,49 @@ def generate_outreach_email(
     your_background: str,
     your_name: str,
 ) -> dict:
-    """Generate personalized outreach email. Returns {subject, body}."""
+    """
+    Generate a personalized academic outreach email.
+
+    Returns:
+        {"subject": str, "body": str}
+    """
     prompt = (
         f"Write a professional academic outreach email from {your_name} "
         f"to Professor {professor_name} at {institution}. "
         f"Their research area: {research_area}. "
         f"Sender background: {your_background}. "
-        "The email should: introduce the sender, show genuine interest in the professor's work, "
-        "mention 1-2 specific aspects of their research, and politely ask about research opportunities. "
-        "Keep it under 250 words. Return JSON: {\"subject\": \"...\", \"body\": \"...\"}"
+        f"Requirements: introduce the sender warmly, show genuine knowledge of "
+        f"the professor's research area, mention 1-2 specific aspects, and "
+        f"politely inquire about research opportunities. Keep it under 250 words. "
+        f'Respond ONLY with a JSON object with keys "subject" and "body".'
     )
 
-    if _ollama_available():
-        try:
-            raw = _ollama_generate(
-                prompt,
-                system="You are an expert academic writing assistant."
-            )
-            match = re.search(r'\{.*?\}', raw, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-        except Exception as e:
-            logger.warning(f"Email generation failed: {e}")
+    raw = _hf_chat(
+        prompt,
+        system="You are an expert academic writing assistant. Output valid JSON only.",
+        max_tokens=512,
+    )
 
-    # Fallback template
+    if raw:
+        parsed = _extract_json_object(raw)
+        if parsed and "subject" in parsed and "body" in parsed:
+            return {
+                "subject": str(parsed["subject"]),
+                "body": str(parsed["body"]),
+            }
+
+    logger.info("Outreach email: using template fallback.")
     return {
         "subject": f"Research Opportunity Inquiry — {research_area}",
         "body": (
             f"Dear Professor {professor_name},\n\n"
-            f"I am {your_name}, and I have been following your work at {institution} "
-            f"in {research_area} with great interest.\n\n"
+            f"I am {your_name}, and I have been following your work at "
+            f"{institution} in {research_area} with great interest.\n\n"
             f"{your_background}\n\n"
-            "I would be very grateful for any opportunity to contribute to your research group "
-            "as a graduate student or research assistant. I have attached my CV for your review.\n\n"
-            "Thank you for your time and consideration.\n\n"
+            f"I would be very grateful for any opportunity to contribute to "
+            f"your research group as a graduate student or research assistant. "
+            f"I have attached my CV for your review.\n\n"
+            f"Thank you for your time and consideration.\n\n"
             f"Best regards,\n{your_name}"
         ),
     }
